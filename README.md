@@ -1,0 +1,2 @@
+# Trump-China-tariffs-autotrader-using-chatgpt-API
+Real-time bot that watches for Trump's tweets for “tariff”, redirects messages to GPT-5 Nano for simple analysis, and trades ETHUSDT on Binance USDT-M Futures (positive→long, negative→short). Sets TP/SL with retries &amp; fallbacks, enforces cooldown/idempotency, skips existing positions, sends Telegram alerts, and provides full logging + health checks
