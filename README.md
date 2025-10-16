@@ -1,6 +1,6 @@
 # Trump-China-tariffs-autotrader-using-chatgpt-API
 
-Real-time trading bot that watches two Telegram channels for the word **“tariff”**, classifies each hit with OpenAI, and trades **ETHUSDT** on **Binance USDT-M Futures** accordingly.
+Real-time trading bot that watches two Telegram channels (Trump's TruthSocial scraper and a test channel) for the word **“tariff”**, classifies each hit with OpenAI, and trades **ETHUSDT** on **Binance USDT-M Futures** accordingly.
 
 > **Speed note:** **ChatGPT 5 Nano typically takes ~6–7 seconds** per analysis. **ChatGPT 3.5 Turbo is ~2–3 seconds** but may be **less accurate**.
 
