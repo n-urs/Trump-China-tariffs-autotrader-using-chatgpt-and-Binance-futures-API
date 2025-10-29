@@ -38,6 +38,9 @@ BINANCE_API_SECRET = _clean(os.getenv("BINANCE_API_SECRET"))
 OPENAI_API_KEY = _clean(os.getenv("OPENAI_API_KEY"))
 
 ORDER_QTY = Decimal(_clean(os.getenv("ORDER_QUANTITY") or "50"))
+# Superpositive size (defaults to ORDER_QTY if not set)
+ORDER_QTY_SUPER = Decimal(_clean(os.getenv("ORDER_QUANTITY_SUPER") or str(ORDER_QTY)))
+
 CONTRACT_PAIR = _clean(os.getenv("CONTRACT_PAIR") or "ETHUSDT").upper()
 
 LONG_TP_MULT = Decimal(_clean(os.getenv("LONG_TP_MULTIPLIER") or "1.029"))
@@ -57,8 +60,37 @@ HEALTHCHECK_INTERVAL = int(_clean(os.getenv("HEALTHCHECK_INTERVAL") or "30"))
 RESTART_DELAY = int(_clean(os.getenv("RESTART_DELAY") or "5"))
 TRADE_COOLDOWN_SEC = int(_clean(os.getenv("TRADE_COOLDOWN_SEC") or "300"))
 
+# Original GPT-classified channels
 TARGET_CHANNEL_IDS = {-1002442330266, -1002833482708}
+# New logic-only channels
+LOGIC_CHANNEL_IDS = {-1002481959011, -1002364176580}
+ALL_CHANNEL_IDS = set(TARGET_CHANNEL_IDS) | set(LOGIC_CHANNEL_IDS)
+
 TARIFF_PATTERN = re.compile(r"tariff", flags=re.IGNORECASE)
+
+# ===== Logic trigger regexes for 10–25% =====
+LOGIC_NEED_TARIFF = re.compile(r"tariff", re.IGNORECASE)
+LOGIC_NEED_CHIN = re.compile(r"chin", re.IGNORECASE)  # matches china, chinese, chin...
+# numeric: 10..25 followed by %, percent, per cent, or parcent
+NUMERIC_PERCENT = re.compile(
+    r"\b(?:1[0-9]|2[0-5])\s*(?:%|percent|per\s*cent|parcent)\b",
+    re.IGNORECASE
+)
+# spelled-out 10..25: ten..nineteen, twenty, twenty-one..twenty-five
+WORDS_10_19 = r"(?:ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen)"
+WORDS_20_25 = r"(?:twenty(?:[-\s]?(?:one|two|three|four|five))?)"
+SPELL_PERCENT = re.compile(
+    rf"\b(?:{WORDS_10_19}|{WORDS_20_25})\s*(?:percent|per\s*cent|parcent)\b",
+    re.IGNORECASE
+)
+
+def logic_superpositive_trigger(text: str) -> bool:
+    """Return True if text satisfies logic trigger: tariff + chin + (10–25%)."""
+    return (
+        LOGIC_NEED_TARIFF.search(text) is not None
+        and LOGIC_NEED_CHIN.search(text) is not None
+        and (NUMERIC_PERCENT.search(text) is not None or SPELL_PERCENT.search(text) is not None)
+    )
 
 # =========================
 # Logging
@@ -164,6 +196,7 @@ async def assert_binance_ready() -> bool:
         return True
     except Exception as e:
         logger.exception("Futures auth check exception: %s", e)
+    # Alert outside except to avoid duplicate alerts on JSON decode
         await send_alert("🛑 Binance Futures auth check exception; see logs.")
         return False
 
@@ -313,20 +346,21 @@ async def place_tp_sl(
 # =========================
 async def classify_with_gpt5_nano(message_text: str) -> str:
     """
-    Send to GPT-5 Nano via Responses API; return one of:
-    positive | negative | neutral | irrelevant
+    Returns one of: superpositive | positive | negative | neutral | irrelevant
+    (Prompt already updated by you; leaving as-is.)
     """
     import re as _re
     prompt = (
         f"{message_text}\n"
-        "Analyze message above written by Donald Trump on the presence of any information regarding U.S. tariffs for China. "
-        'If there is clear information about tariffs on China, write if it is "positive", "negative", or "neutral". '
-        'If the message is irrelevant to the tariffs on China, respond "irrelevant". ANSWER IN ONE WORD ONLY: positive, negative, neutral, irrelevant.\n\n'
-        "Also, when analyzing, keep in mind that recently, Donald Trump said he wants to introduce a 100% tariff on China. "
-        "If in the new message there is information regarding a tariff rate that is higher or equal to 100%, it is negative news. "
-        "If the new message has a lower rate than 100% or says there won't be a tariff or it stays at 30%, it is positive. "
+        "Analyze the message above written by Donald Trump on the presence of any information regarding U.S. tariffs for China. "
+        'If there is clear information about tariffs on China, write if it is "superpositive", "positive", "negative", or "neutral". '
+        'If the message is irrelevant to the tariffs on China, respond "irrelevant". ANSWER IN ONE WORD ONLY: superpositive, positive, negative, neutral, irrelevant.\n\n'
         "If there is only a picture or other irrelevant info, it is irrelevant. "
-        "If the message is about China but there is no clear tariff rate indication, it is neutral."
+        "If the message is about China but there is no clear tariff rate indication, it is neutral. "
+        "If the new tariff rate is less than 30%, then respond superpositive. "
+        "If the new tariff rate is equal to 30%, then respond positive. "
+        "If the new tariff rate is more than 30%, then respond negative. "
+        'If the message explicitly says the U.S. and China have reached a deal (e.g., "reached an agreement", "deal finalized", "agreement signed"), respond positive.'
     )
     try:
         resp = await openai_client.responses.create(
@@ -334,24 +368,8 @@ async def classify_with_gpt5_nano(message_text: str) -> str:
             input=prompt
         )
         text = (resp.output_text or "").strip().lower()
-        m = _re.search(r"\b(positive|negative|neutral|irrelevant)\b", text)
-        label = m.group(1) if m else "irrelevant"
-
-        # Optional usage logging (if available)
-        try:
-            u = getattr(resp, "usage", None)
-            if u:
-                logger.info(
-                    "OpenAI usage: input=%s output=%s reasoning=%s total=%s",
-                    getattr(u, "input_tokens", None),
-                    getattr(u, "output_tokens", None),
-                    getattr(u, "reasoning_tokens", None),
-                    getattr(u, "total_tokens", None),
-                )
-        except Exception:
-            pass
-
-        return label
+        m = _re.search(r"\b(superpositive|positive|negative|neutral|irrelevant)\b", text)
+        return m.group(1) if m else "irrelevant"
     except Exception as e:
         logger.exception("OpenAI classification failed: %s", e)
         return "irrelevant"
@@ -376,17 +394,34 @@ async def healthcheck_loop(tg_client: TelegramClient) -> None:
             logger.exception("Healthcheck error: %s", e)
         await asyncio.sleep(HEALTHCHECK_INTERVAL)
 
-async def process_trade_pipeline(text: str, channel_id: int, message_id: int, event_time: float) -> None:
+async def process_trade_pipeline(
+    text: str,
+    channel_id: int,
+    message_id: int,
+    event_time: float,
+    override_label: Optional[str] = None,
+    source: str = "GPT",
+) -> None:
     global last_trade_ts
 
-    # --- Classify
-    t1 = time.perf_counter()
-    label = await classify_with_gpt5_nano(text)
-    t2 = time.perf_counter()
-    logger.info(
-        "GPT classification: %s | channel=%s msg_id=%s | durations: to_gpt=%dms",
-        label, channel_id, message_id, int((t2 - t1) * 1000)
-    )
+    # --- Label (logic or GPT)
+    if override_label:
+        label = override_label
+        to_gpt_ms = 0
+        logger.info("Using override label from %s: %s", source, label)
+    else:
+        t1 = time.perf_counter()
+        label = await classify_with_gpt5_nano(text)
+        t2 = time.perf_counter()
+        to_gpt_ms = int((t2 - t1) * 1000)
+        logger.info(
+            "GPT classification: %s | channel=%s msg_id=%s | durations: to_gpt=%dms",
+            label, channel_id, message_id, to_gpt_ms
+        )
+
+    # Alert on trigger labels (even if we later skip due to cooldown/position)
+    if label in ("superpositive", "positive", "negative"):
+        await send_alert(f"📣 Trigger ({source}): <b>{label.upper()}</b> | chat={channel_id} msg={message_id}")
 
     if label == "irrelevant":
         logger.info("Irrelevant message: logged only.")
@@ -417,18 +452,25 @@ async def process_trade_pipeline(text: str, channel_id: int, message_id: int, ev
             logger.info("Existing ETHUSDT position detected (%.3f). Skipping new trade.", pos_amt)
             return
 
-        side_open = "BUY" if label == "positive" else "SELL"
-        side_exit = "SELL" if label == "positive" else "BUY"
+        # Decide side and quantity
+        if label in ("positive", "superpositive"):
+            side_open = "BUY"
+            side_exit = "SELL"
+            qty = ORDER_QTY_SUPER if label == "superpositive" else ORDER_QTY
+        else:  # negative
+            side_open = "SELL"
+            side_exit = "BUY"
+            qty = ORDER_QTY
 
         # --- Place market order
         t3 = time.perf_counter()
-        await send_alert(f"⚙️ Sending MARKET {side_open} {ORDER_QTY} {CONTRACT_PAIR} (reason: {label})")
-        order_resp = await place_market_order(side_open, ORDER_QTY)
+        await send_alert(f"⚙️ Trigger={source} — Sending MARKET {side_open} {qty} {CONTRACT_PAIR} (reason: {label})")
+        order_resp = await place_market_order(side_open, qty)
         t4 = time.perf_counter()
         if not order_resp:
             logger.error("Market order failed; aborting.")
             return
-        await send_alert(f"✅ Order sent: {side_open} {ORDER_QTY} {CONTRACT_PAIR}. Took {int((t4 - t3)*1000)}ms")
+        await send_alert(f"✅ Order sent: {side_open} {qty} {CONTRACT_PAIR}. Took {int((t4 - t3)*1000)}ms")
 
         # --- Confirm position open & get entry
         entry_price: Decimal = Decimal("0")
@@ -450,11 +492,11 @@ async def process_trade_pipeline(text: str, channel_id: int, message_id: int, ev
             logger.error("Position failed to open or entry price unavailable; aborting.")
             return
         await send_alert(
-            f"🟩 Position opened: side={side_open} qty={ORDER_QTY} entry≈{entry_price} ({int((t6 - t5)*1000)}ms confirm)"
+            f"🟩 Position opened: side={side_open} qty={qty} entry≈{entry_price} ({int((t6 - t5)*1000)}ms confirm)"
         )
 
         # --- TP/SL math
-        if label == "positive":  # LONG
+        if label in ("positive", "superpositive"):  # LONG
             tp = Decimal(price2(entry_price * LONG_TP_MULT))
             sl = Decimal(price2(entry_price * LONG_SL_MULT))
             tp_fb = Decimal(price2(entry_price * LONG_TP_FALLBACK_MULT))
@@ -492,26 +534,46 @@ async def telegram_runner() -> None:
 
     async def handle_new_message(event):
         try:
-            if event.chat_id not in TARGET_CHANNEL_IDS:
+            if event.chat_id not in ALL_CHANNEL_IDS:
                 return
             text = (event.raw_text or "").strip()
             if not text:
                 return
-            if not TARIFF_PATTERN.search(text):
-                return
-            event_time = time.perf_counter()
-            logger.info("Message matched 'tariff': chat=%s msg_id=%s len=%d",
-                        event.chat_id, event.message.id, len(text))
-            await process_trade_pipeline(text, event.chat_id, event.message.id, event_time)
+
+            # Logic-only channels first (no GPT call here)
+            if event.chat_id in LOGIC_CHANNEL_IDS:
+                if logic_superpositive_trigger(text):
+                    logger.info(
+                        "Logic hit: tariff+chin+10-25%% | chat=%s msg_id=%s len=%d",
+                        event.chat_id, event.message.id, len(text),
+                    )
+                    await process_trade_pipeline(
+                        text, event.chat_id, event.message.id, time.perf_counter(),
+                        override_label="superpositive",
+                        source="LOGIC",
+                    )
+                return  # Do not pass to GPT for logic-only channels
+
+            # GPT-classified channels
+            if event.chat_id in TARGET_CHANNEL_IDS:
+                if not TARIFF_PATTERN.search(text):
+                    return
+                logger.info("Message matched 'tariff': chat=%s msg_id=%s len=%d",
+                            event.chat_id, event.message.id, len(text))
+                await process_trade_pipeline(
+                    text, event.chat_id, event.message.id, time.perf_counter(),
+                    override_label=None,
+                    source="GPT",
+                )
         except Exception as e:
             logger.exception("Error in message handler: %s", e)
 
     tg_client.add_event_handler(
-        handle_new_message, events.NewMessage(chats=list(TARGET_CHANNEL_IDS))
+        handle_new_message, events.NewMessage(chats=list(ALL_CHANNEL_IDS))
     )
 
     await tg_client.start(phone=TG_PHONE)
-    logger.info("Telegram client started. Monitoring channels: %s", ", ".join(map(str, TARGET_CHANNEL_IDS)))
+    logger.info("Telegram client started. Monitoring channels: %s", ", ".join(map(str, ALL_CHANNEL_IDS)))
     hc_task = asyncio.create_task(healthcheck_loop(tg_client))
     try:
         await stop_event.wait()
@@ -554,3 +616,4 @@ async def main_loop():
 
 if __name__ == "__main__":
     asyncio.run(main_loop())
+
